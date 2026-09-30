@@ -413,6 +413,34 @@ const bool = v => !!(v === true || v === 1 || v === '1' || v === 'true');
 const audit = (userId, action, details='') => db.prepare('INSERT INTO audit_logs(user_id,action,details) VALUES(?,?,?)').run(userId || null, action, details);
 const userView = u => u ? ({ id:u.id, name:u.name, username:u.username || '', email:u.email, phone:u.phone || '', role:u.role, active:!!u.active, is_main_admin:!!u.is_main_admin }) : null;
 
+function recoverNeonDatabaseIfNeeded() {
+  if (!process.env.DATABASE_URL) return false;
+
+  try {
+    if (db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()) {
+      return true;
+    }
+  } catch (e) {}
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(ROOT, 'neon-sync.js'), 'restore', DB_FILE],
+    { stdio: 'inherit', env: process.env, timeout: 15000 }
+  );
+
+  if (result.error || result.status !== 0) {
+    console.error('[Neon] Recovery restore failed.');
+    return false;
+  }
+
+  try {
+    return !!db.prepare(
+      "SELECT 1 FROM users WHERE role='admin' LIMIT 1"
+    ).get();
+  } catch (e) {
+    return false;
+  }
+}
 function hashPassword(password) {
   return bcrypt.hashSync(password, 12);
 }
@@ -554,9 +582,27 @@ function gradeFromPercent(p) {
   if (p>=50) return {grade:'B',gpa:3}; if (p>=40) return {grade:'C',gpa:2}; if (p>=33) return {grade:'D',gpa:1}; return {grade:'F',gpa:0};
 }
 
-app.get('/api/setup/status',(req,res)=>res.json({needsAdmin:!db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()}));
+app.get('/api/setup/status',(req,res)=>{
+  if (!db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()) {
+    recoverNeonDatabaseIfNeeded();
+  }
+
+  res.json({
+    needsAdmin: !db.prepare(
+      "SELECT 1 FROM users WHERE role='admin' LIMIT 1"
+    ).get()
+  });
+});
 app.post('/api/setup/admin',(req,res)=>{
-  if (db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()) return res.status(400).json({error:'Admin setup is already completed'});
+  if (!db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()) {
+    recoverNeonDatabaseIfNeeded();
+  }
+
+  if (db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()) {
+    return res.status(400).json({
+      error:'Admin setup is already completed'
+    });
+  }
   const name=clean(req.body.name), email=clean(req.body.email).toLowerCase(), password=String(req.body.password||''), confirm=String(req.body.confirm||'');
   if (!name || !validEmail(email) || password.length<8 || password!==confirm) return res.status(400).json({error:'Enter a valid name, email and matching password (minimum 8 characters).'});
   const info=db.prepare("INSERT INTO users(name,email,password_hash,role,is_main_admin) VALUES(?,?,?,'admin',1)").run(name,email,hashPassword(password));
@@ -564,6 +610,10 @@ app.post('/api/setup/admin',(req,res)=>{
 });
 
 app.post('/api/login',(req,res)=>{
+  if (!db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()) {
+    recoverNeonDatabaseIfNeeded();
+  }
+
   const identifier=clean(req.body.identifier||req.body.email).toLowerCase();
   const password=String(req.body.password||'');
   const role=clean(req.body.role).toLowerCase();
