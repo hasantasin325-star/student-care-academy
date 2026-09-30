@@ -2,7 +2,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 
@@ -42,6 +42,22 @@ function runNeonSync() {
   });
 }
 
+function syncNeonNow() {
+  if (!process.env.DATABASE_URL) return true;
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(ROOT, 'neon-sync.js'), 'sync', DB_FILE],
+    { stdio: 'inherit', env: process.env, timeout: 15000 }
+  );
+
+  if (result.error) {
+    console.error('[Neon] immediate sync error:', result.error.message);
+    return false;
+  }
+
+  return result.status === 0;
+}
 function scheduleNeonSync(delay = 10000) {
   if (!process.env.DATABASE_URL) return;
 
@@ -544,7 +560,7 @@ app.post('/api/setup/admin',(req,res)=>{
   const name=clean(req.body.name), email=clean(req.body.email).toLowerCase(), password=String(req.body.password||''), confirm=String(req.body.confirm||'');
   if (!name || !validEmail(email) || password.length<8 || password!==confirm) return res.status(400).json({error:'Enter a valid name, email and matching password (minimum 8 characters).'});
   const info=db.prepare("INSERT INTO users(name,email,password_hash,role,is_main_admin) VALUES(?,?,?,'admin',1)").run(name,email,hashPassword(password));
-  audit(info.lastInsertRowid,'INITIAL_ADMIN_SETUP',email); res.json({ok:true});
+  audit(info.lastInsertRowid,'INITIAL_ADMIN_SETUP',email); syncNeonNow(); res.json({ok:true});
 });
 
 app.post('/api/login',(req,res)=>{
@@ -1410,7 +1426,7 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-if (process.env.DATABASE_URL) {
+if (process.env.DATABASE_URL && db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()) {
   setTimeout(() => scheduleNeonSync(1000), 5000);
 }
 // NEON_SYNC_SHUTDOWN_END
