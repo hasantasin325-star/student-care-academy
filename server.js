@@ -9,8 +9,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
-const DB_FILE = path.join(ROOT, 'academy.db');
-const UPLOADS = path.join(ROOT, 'uploads');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : ROOT;
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const DB_FILE = path.join(DATA_DIR, 'academy.db');
+const UPLOADS = path.join(DATA_DIR, 'uploads');
 fs.mkdirSync(UPLOADS, { recursive: true });
 
 app.disable('x-powered-by');
