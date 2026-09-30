@@ -708,7 +708,7 @@ app.post('/api/subjects',requireAuth,requireRole('admin'),(req,res)=>{try{const 
 app.patch('/api/subjects/:id',requireAuth,requireRole('admin'),(req,res)=>{db.prepare('UPDATE subjects SET name=?,active=? WHERE id=?').run(clean(req.body.name),bool(req.body.active)?1:0,req.params.id);res.json({ok:true});});
 
 app.get('/api/students',requireAuth,(req,res)=>{
-  let rows=db.prepare(`SELECT s.id,s.user_id,s.class_id,s.section_id,s.roll,s.student_id,s.guardian_phone,u.name,u.email,u.phone,u.active,c.class_no, c.name class_name, sec.name section_name FROM students s JOIN users u ON u.id=s.user_id LEFT JOIN classes c ON c.id=s.class_id LEFT JOIN sections sec ON sec.id=s.section_id ORDER BY c.class_no,sec.name,s.roll`).all();
+  let rows=db.prepare(`SELECT s.id,s.user_id,s.class_id,s.section_id,s.roll,s.student_id,s.guardian_phone,u.name,u.email,u.phone,u.active,c.class_no, c.name class_name, sec.name section_name FROM students s JOIN users u ON u.id=s.user_id AND u.active=1 LEFT JOIN classes c ON c.id=s.class_id LEFT JOIN sections sec ON sec.id=s.section_id ORDER BY c.class_no,sec.name,s.roll`).all();
   if(req.user.role==='student')rows=rows.filter(x=>x.user_id===req.user.id);
   if(req.user.role==='parent'){const ids=new Set(studentsForUser(req.user).map(s=>s.id));rows=rows.filter(x=>ids.has(x.id));}
   res.json(rows);
@@ -721,41 +721,72 @@ app.post('/api/students',requireAuth,requireRole('admin'),(req,res)=>{
   const username=clean(r.username||r.student_id).toLowerCase();
   const password=String(r.password||'');
 
-  if(
-    !name ||
-    !validEmail(email) ||
-    !username ||
-    !/^[a-z0-9._-]{3,30}$/.test(username) ||
-    password.length<8 ||
-    !r.student_id ||
-    !r.class_id
-  ){
+  if(!username || !r.student_id || !r.class_id){
     return res.status(400).json({
-      error:'Name, username, email, 8+ character password, Student ID and Class are required'
+      error:'Username, Student ID and Class are required'
     });
   }
 
   try{
-    const tx=db.transaction(()=>{
-      const u=db.prepare(`
-        INSERT INTO users
-        (name,username,email,password_hash,role,phone)
-        VALUES(?,?,?,?,?,?)
-      `).run(
-        name,
-        username,
-        email,
-        hashPassword(password),
-        'student',
-        clean(r.phone)
-      );
+    const id=db.transaction(()=>{
+      let u=db.prepare(`
+        SELECT id,name,email,password_hash,role
+        FROM users
+        WHERE LOWER(username)=?
+        LIMIT 1
+      `).get(username);
+
+      if(u){
+        if(u.role!=='student'){
+          throw new Error('This username already belongs to another user.');
+        }
+
+        const existingProfile=db.prepare(
+          'SELECT id FROM students WHERE user_id=?'
+        ).get(u.id);
+
+        if(existingProfile){
+          throw new Error('This user is already registered as a student.');
+        }
+      }else{
+        if(
+          !name ||
+          !validEmail(email) ||
+          !/^[a-z0-9._-]{3,30}$/.test(username) ||
+          password.length<8
+        ){
+          throw new Error(
+            'For a new student, Name, valid Email and 8+ character Password are required.'
+          );
+        }
+
+        const hash=hashPassword(password);
+
+        const result=db.prepare(`
+          INSERT INTO users
+          (name,username,email,password_hash,role,phone)
+          VALUES(?,?,?,?,?,?)
+        `).run(
+          name,
+          username,
+          email,
+          hash,
+          'student',
+          clean(r.phone)
+        );
+
+        u={
+          id:Number(result.lastInsertRowid),
+          role:'student'
+        };
+      }
 
       const st=db.prepare(`
         INSERT INTO students
         (user_id,class_id,section_id,roll,student_id,guardian_phone)
         VALUES(?,?,?,?,?,?)
       `).run(
-        u.lastInsertRowid,
+        u.id,
         Number(r.class_id),
         r.section_id?Number(r.section_id):null,
         clean(r.roll),
@@ -763,10 +794,7 @@ app.post('/api/students',requireAuth,requireRole('admin'),(req,res)=>{
         clean(r.guardian_phone)
       );
 
-      const total=Math.max(
-        0,
-        Number(r.total_fee)||0
-      );
+      const total=Math.max(0,Number(r.total_fee)||0);
 
       db.prepare(`
         INSERT INTO fees
@@ -792,12 +820,9 @@ app.post('/api/students',requireAuth,requireRole('admin'),(req,res)=>{
         );
       }
 
-      return st.lastInsertRowid;
-    });
+      return Number(st.lastInsertRowid);
+    })();
 
-    const id=tx();
-
-    syncLegacyDue(id);
     ensureUpcomingCycle(id);
 
     audit(
@@ -811,6 +836,7 @@ app.post('/api/students',requireAuth,requireRole('admin'),(req,res)=>{
     res.status(400).json({error:e.message});
   }
 });
+
 app.patch('/api/students/:id',requireAuth,requireRole('admin'),(req,res)=>{db.prepare(`UPDATE students SET class_id=?,section_id=?,roll=?,guardian_phone=? WHERE id=?`).run(req.body.class_id?Number(req.body.class_id):null,req.body.section_id?Number(req.body.section_id):null,clean(req.body.roll),clean(req.body.guardian_phone),req.params.id);res.json({ok:true});});
 app.post('/api/parent-links',requireAuth,requireRole('admin'),(req,res)=>{try{const parent=db.prepare('SELECT id FROM parents WHERE user_id=?').get(req.body.parent_user_id);if(!parent)return res.status(400).json({error:'Parent profile not found'});db.prepare('INSERT OR IGNORE INTO parent_students(parent_id,student_id) VALUES(?,?)').run(parent.id,Number(req.body.student_id));res.json({ok:true});}catch(e){res.status(400).json({error:e.message});}});
 app.get('/api/parents',requireAuth,requireRole('admin','teacher'),(req,res)=>res.json(db.prepare(`SELECT p.id,p.user_id,u.name,u.email,u.phone,u.active,COALESCE((SELECT COUNT(*) FROM parent_students ps WHERE ps.parent_id=p.id),0) children FROM parents p JOIN users u ON u.id=p.user_id ORDER BY u.name`).all()));
@@ -1431,3 +1457,4 @@ if (process.env.DATABASE_URL && db.prepare("SELECT 1 FROM users WHERE role='admi
 }
 // NEON_SYNC_SHUTDOWN_END
 app.listen(PORT,()=>console.log(`Student Care Academy running at http://localhost:${PORT}`));
+
