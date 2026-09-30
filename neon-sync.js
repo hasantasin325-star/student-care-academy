@@ -9,32 +9,16 @@ const databaseUrl = process.env.DATABASE_URL;
 
 if (!databaseUrl) process.exit(0);
 
-async function getClient() {
-  const client = new Client({
-    connectionString: databaseUrl,
-    ssl: { rejectUnauthorized: false }
-  });
-
-  await client.connect();
-
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS app_sqlite_snapshot (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      db BYTEA NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  return client;
-}
-
-function localHasAdmin() {
-  if (!fs.existsSync(dbFile)) return false;
+function fileHasAdmin(file) {
+  if (!fs.existsSync(file)) return false;
 
   let db = null;
 
   try {
-    db = new Database(dbFile, { readonly: true, fileMustExist: true });
+    db = new Database(file, {
+      readonly: true,
+      fileMustExist: true
+    });
 
     const usersTable = db.prepare(
       "SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'"
@@ -54,15 +38,30 @@ function localHasAdmin() {
   }
 }
 
+async function getClient() {
+  const client = new Client({
+    connectionString: databaseUrl,
+    ssl: { rejectUnauthorized: false }
+  });
+
+  await client.connect();
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS app_sqlite_snapshot (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      db BYTEA NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  return client;
+}
+
 async function restore() {
   const client = await getClient();
+  const tmpFile = dbFile + '.restore';
 
   try {
-    if (localHasAdmin()) {
-      console.log('[Neon] Existing local admin found; restore skipped.');
-      return;
-    }
-
     const result = await client.query(
       'SELECT db FROM app_sqlite_snapshot WHERE id=1'
     );
@@ -72,26 +71,50 @@ async function restore() {
       return;
     }
 
-    const tmpFile = dbFile + '.restore';
+    try { fs.rmSync(tmpFile, { force: true }); } catch (e) {}
+    fs.writeFileSync(tmpFile, result.rows[0].db);
+
+    /*
+      Critical protection:
+      Never restore a snapshot unless that snapshot actually contains
+      at least one admin account.
+    */
+    if (!fileHasAdmin(tmpFile)) {
+      console.log('[Neon] Snapshot contains no admin; restore skipped.');
+      return;
+    }
+
     const walFile = dbFile + '-wal';
     const shmFile = dbFile + '-shm';
 
-    try { fs.rmSync(tmpFile, { force: true }); } catch (e) {}
     try { fs.rmSync(walFile, { force: true }); } catch (e) {}
     try { fs.rmSync(shmFile, { force: true }); } catch (e) {}
     try { fs.rmSync(dbFile, { force: true }); } catch (e) {}
 
-    fs.writeFileSync(tmpFile, result.rows[0].db);
     fs.renameSync(tmpFile, dbFile);
 
-    console.log('[Neon] SQLite snapshot restored.');
+    console.log('[Neon] Valid admin snapshot restored.');
   } finally {
+    try { fs.rmSync(tmpFile, { force: true }); } catch (e) {}
     await client.end();
   }
 }
 
 async function sync() {
-  if (!fs.existsSync(dbFile)) return;
+  /*
+    Critical protection:
+    An empty/uninitialized SQLite database must never overwrite
+    a valid Neon snapshot.
+  */
+  if (!fs.existsSync(dbFile)) {
+    console.log('[Neon] Local database not found; sync skipped.');
+    return;
+  }
+
+  if (!fileHasAdmin(dbFile)) {
+    console.log('[Neon] Local database has no admin; snapshot sync skipped.');
+    return;
+  }
 
   const client = await getClient();
   const tempFile = dbFile + '.neon-backup';
@@ -110,6 +133,14 @@ async function sync() {
       db.close();
     }
 
+    /*
+      Verify the backup itself before uploading it.
+    */
+    if (!fileHasAdmin(tempFile)) {
+      console.log('[Neon] Backup validation failed; sync skipped.');
+      return;
+    }
+
     const data = fs.readFileSync(tempFile);
 
     await client.query(`
@@ -121,7 +152,7 @@ async function sync() {
         updated_at=NOW()
     `, [data]);
 
-    console.log('[Neon] SQLite snapshot synced.');
+    console.log('[Neon] Valid admin SQLite snapshot synced.');
   } finally {
     try { fs.rmSync(tempFile, { force: true }); } catch (e) {}
     await client.end();
