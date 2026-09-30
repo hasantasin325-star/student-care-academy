@@ -226,15 +226,123 @@ if (!db.prepare("SELECT 1 FROM users WHERE role='admin' AND is_main_admin=1 LIMI
   const firstAdmin = db.prepare("SELECT id FROM users WHERE role='admin' ORDER BY id ASC LIMIT 1").get();
   if (firstAdmin) db.prepare("UPDATE users SET is_main_admin=1 WHERE id=?").run(firstAdmin.id);
 }
+
 for (let i = 1; i <= 12; i++) {
   db.prepare('INSERT OR IGNORE INTO classes(class_no,name) VALUES(?,?)').run(i, `Class ${i}`);
 }
 
 const now = () => new Date().toISOString();
 const clean = v => (v == null ? '' : String(v).trim());
+
+// MIGRATION_MOVED_AFTER_CLEAN
+try {
+  db.exec("ALTER TABLE users ADD COLUMN username TEXT");
+} catch (e) {}
+
+try {
+  db.exec("ALTER TABLE fees ADD COLUMN monthly_fee REAL NOT NULL DEFAULT 0");
+} catch (e) {}
+
+try {
+  db.exec("ALTER TABLE payments ADD COLUMN fee_month TEXT DEFAULT ''");
+} catch (e) {}
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS fee_cycles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id INTEGER NOT NULL,
+  month_key TEXT NOT NULL,
+  amount REAL NOT NULL DEFAULT 0,
+  paid_amount REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'UPCOMING'
+    CHECK(status IN ('UPCOMING','DUE','PAID')),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(student_id,month_key),
+  FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE
+);
+`);
+
+const existingUsers = db.prepare(`
+  SELECT
+    u.id,
+    u.email,
+    u.role,
+    COALESCE(u.username,'') username,
+    (SELECT student_id FROM students WHERE user_id=u.id LIMIT 1) student_id
+  FROM users u
+  ORDER BY u.id
+`).all();
+
+const usedUsernames = new Set(
+  existingUsers.map(x => clean(x.username).toLowerCase()).filter(Boolean)
+);
+
+for (const u of existingUsers) {
+  if (clean(u.username)) continue;
+
+  let base = clean(u.student_id) ||
+             clean(u.email).split('@')[0] ||
+             (u.role + u.id);
+
+  base = base.toLowerCase()
+    .replace(/[^a-z0-9._-]+/g,'')
+    .slice(0,24) || (u.role + u.id);
+
+  let candidate = base;
+  let n = 1;
+
+  while (usedUsernames.has(candidate.toLowerCase())) {
+    candidate = (base + n++).slice(0,30);
+  }
+
+  usedUsernames.add(candidate.toLowerCase());
+
+  db.prepare(
+    'UPDATE users SET username=? WHERE id=?'
+  ).run(candidate,u.id);
+}
+
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
+  ON users(username)
+  WHERE username IS NOT NULL AND username<>'';
+`);
+
+const legacyFees = db.prepare(
+  'SELECT student_id,total_fee,additional_charge,due,adjustment FROM fees'
+).all();
+
+for (const f of legacyFees) {
+  const amount = Math.max(
+    0,
+    Number(f.total_fee || 0) +
+    Number(f.additional_charge || 0) +
+    Number(f.adjustment || 0)
+  );
+
+  const due = Math.max(0, Number(f.due || 0));
+
+  if (amount > 0 || due > 0) {
+    const paid = Math.min(amount, Math.max(0, amount - due));
+    const status = due <= 0 ? 'PAID' : 'DUE';
+
+    db.prepare(`
+      INSERT OR IGNORE INTO fee_cycles
+      (student_id,month_key,amount,paid_amount,status)
+      VALUES(?,?,?,?,?)
+    `).run(
+      f.student_id,
+      new Date().toISOString().slice(0,7),
+      amount,
+      paid,
+      status
+    );
+  }
+}
 const bool = v => !!(v === true || v === 1 || v === '1' || v === 'true');
 const audit = (userId, action, details='') => db.prepare('INSERT INTO audit_logs(user_id,action,details) VALUES(?,?,?)').run(userId || null, action, details);
-const userView = u => u ? ({ id:u.id, name:u.name, email:u.email, phone:u.phone || '', role:u.role, active:!!u.active, is_main_admin:!!u.is_main_admin }) : null;
+const userView = u => u ? ({ id:u.id, name:u.name, username:u.username || '', email:u.email, phone:u.phone || '', role:u.role, active:!!u.active, is_main_admin:!!u.is_main_admin }) : null;
 
 function hashPassword(password) {
   return bcrypt.hashSync(password, 12);
@@ -291,6 +399,87 @@ function notifyUser(userId,title,message,kind='notice') { db.prepare('INSERT INT
 function publishNotice(n) {
   for (const id of recipientIds(n.target_type,n.target_value)) notifyUser(id,n.title,n.content,'notice');
 }
+function currentMonthKey(){
+  return new Date().toISOString().slice(0,7);
+}
+
+function shiftMonth(key,delta){
+  const [y,m]=String(key).split('-').map(Number);
+  const d=new Date(Date.UTC(y,m-1+delta,1));
+  return d.toISOString().slice(0,7);
+}
+
+function advanceFeeStatuses(){
+  const current=currentMonthKey();
+
+  db.prepare(
+    "UPDATE fee_cycles SET status='DUE',updated_at=? WHERE status='UPCOMING' AND month_key<=?"
+  ).run(now(),current);
+
+  db.prepare(
+    "UPDATE fee_cycles SET status='PAID',updated_at=? WHERE status='DUE' AND paid_amount>=amount"
+  ).run(now());
+}
+
+function ensureUpcomingCycle(studentId){
+  const fee=db.prepare(
+    'SELECT monthly_fee FROM fees WHERE student_id=?'
+  ).get(studentId);
+
+  const monthly=Math.max(0,Number(fee?.monthly_fee||0));
+  if(!monthly)return;
+
+  const next=shiftMonth(currentMonthKey(),1);
+
+  db.prepare(`
+    INSERT OR IGNORE INTO fee_cycles
+    (student_id,month_key,amount,paid_amount,status)
+    VALUES(?,?,?,0,'UPCOMING')
+  `).run(studentId,next,monthly);
+}
+
+function syncLegacyDue(studentId){
+  advanceFeeStatuses();
+
+  const due=db.prepare(`
+    SELECT COALESCE(
+      SUM(
+        CASE
+          WHEN status='DUE' AND amount>paid_amount
+          THEN amount-paid_amount
+          ELSE 0
+        END
+      ),0
+    ) due
+    FROM fee_cycles
+    WHERE student_id=?
+  `).get(studentId).due;
+
+  const fee=db.prepare(
+    'SELECT id FROM fees WHERE student_id=?'
+  ).get(studentId);
+
+  if(fee){
+    db.prepare(
+      'UPDATE fees SET due=?,updated_at=? WHERE student_id=?'
+    ).run(due,now(),studentId);
+  }else{
+    db.prepare(
+      'INSERT INTO fees(student_id,due) VALUES(?,?)'
+    ).run(studentId,due);
+  }
+
+  return due;
+}
+
+advanceFeeStatuses();
+
+for (const st of db.prepare(
+  'SELECT student_id FROM fees'
+).all()) {
+  ensureUpcomingCycle(st.student_id);
+  syncLegacyDue(st.student_id);
+}
 function gradeFromPercent(p) {
   if (p >= 80) return {grade:'A+',gpa:5}; if (p >=70) return {grade:'A',gpa:4}; if (p>=60) return {grade:'A-',gpa:3.5};
   if (p>=50) return {grade:'B',gpa:3}; if (p>=40) return {grade:'C',gpa:2}; if (p>=33) return {grade:'D',gpa:1}; return {grade:'F',gpa:0};
@@ -306,10 +495,34 @@ app.post('/api/setup/admin',(req,res)=>{
 });
 
 app.post('/api/login',(req,res)=>{
-  const email=clean(req.body.email).toLowerCase(), password=String(req.body.password||'');
-  const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
-  if (!u || !u.active || !bcrypt.compareSync(password,u.password_hash)) return res.status(401).json({error:'Invalid email or password'});
-  const token=createSession(u.id); res.setHeader('Set-Cookie',`sca_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`); res.json({user:userView(u)});
+  const identifier=clean(req.body.identifier||req.body.email).toLowerCase();
+  const password=String(req.body.password||'');
+  const role=clean(req.body.role).toLowerCase();
+
+  const u=db.prepare(`
+    SELECT * FROM users
+    WHERE lower(email)=? OR lower(username)=?
+  `).get(identifier,identifier);
+
+  if(
+    !u ||
+    !u.active ||
+    (role && u.role!==role) ||
+    !bcrypt.compareSync(password,u.password_hash)
+  ){
+    return res.status(401).json({
+      error:'Invalid username/email or password'
+    });
+  }
+
+  const token=createSession(u.id);
+
+  res.setHeader(
+    'Set-Cookie',
+    `sca_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`
+  );
+
+  res.json({user:userView(u)});
 });
 app.post('/api/logout',requireAuth,(req,res)=>{const token=req.headers.cookie?.match(/(?:^|;\s*)sca_session=([^;]+)/)?.[1]; if(token) db.prepare('DELETE FROM sessions WHERE token=?').run(token); res.setHeader('Set-Cookie','sca_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); res.json({ok:true});});
 app.get('/api/me',requireAuth,(req,res)=>res.json({user:userView(req.user)}));
@@ -325,17 +538,84 @@ app.get('/api/dashboard',requireAuth,(req,res)=>{
   res.json({role:req.user.role,students:get('SELECT COUNT(*) c FROM students'),teachers:get('SELECT COUNT(*) c FROM teachers'),parents:get('SELECT COUNT(*) c FROM parents'),pendingPayments:get("SELECT COUNT(*) c FROM payments WHERE status='PENDING'"),due:db.prepare('SELECT COALESCE(SUM(due),0) due FROM fees').get().due,unread:db.prepare('SELECT COUNT(*) c FROM notifications WHERE user_id=? AND read=0').get(req.user.id).c});
 });
 
-app.get('/api/users',requireAuth,requireRole('admin'),(req,res)=>res.json(db.prepare('SELECT id,name,email,phone,role,active,is_main_admin,created_at FROM users ORDER BY id DESC').all()));
+app.get('/api/users',requireAuth,requireRole('admin'),
+(req,res)=>res.json(
+  db.prepare(`
+    SELECT id,name,username,email,phone,role,active,is_main_admin,created_at
+    FROM users
+    ORDER BY id DESC
+  `).all()
+));
+
 app.post('/api/users',requireAuth,requireRole('admin'),(req,res)=>{
-  const r=req.body, name=clean(r.name), email=clean(r.email).toLowerCase(), password=String(r.password||'');
-  if(!name||!validEmail(email)||password.length<8||!['admin','teacher','student','parent'].includes(r.role))return res.status(400).json({error:'Valid name, email, role and 8+ character password are required'});
+  const r=req.body;
+  const name=clean(r.name);
+  const username=clean(r.username).toLowerCase();
+  const email=clean(r.email).toLowerCase();
+  const password=String(r.password||'');
+
+  if(
+    !name ||
+    !username ||
+    !/^[a-z0-9._-]{3,30}$/.test(username) ||
+    !validEmail(email) ||
+    password.length<8 ||
+    !['admin','teacher','student','parent'].includes(r.role)
+  ){
+    return res.status(400).json({
+      error:'Valid username, name, email, role and 8+ character password are required'
+    });
+  }
+
   try{
-    const tx=db.transaction(()=>{const u=db.prepare('INSERT INTO users(name,email,password_hash,role,phone) VALUES(?,?,?,?,?)').run(name,email,hashPassword(password),r.role,clean(r.phone));
-      if(r.role==='teacher')db.prepare('INSERT INTO teachers(user_id,subject,designation) VALUES(?,?,?)').run(u.lastInsertRowid,clean(r.subject),clean(r.designation));
-      if(r.role==='parent')db.prepare('INSERT INTO parents(user_id) VALUES(?)').run(u.lastInsertRowid);
-      return u.lastInsertRowid;}); const id=tx(); audit(req.user.id,'CREATE_USER',`${r.role}:${email}`); res.json({id});
-  }catch(e){res.status(400).json({error:e.message});}
+    const tx=db.transaction(()=>{
+      const u=db.prepare(`
+        INSERT INTO users
+        (name,username,email,password_hash,role,phone)
+        VALUES(?,?,?,?,?,?)
+      `).run(
+        name,
+        username,
+        email,
+        hashPassword(password),
+        r.role,
+        clean(r.phone)
+      );
+
+      if(r.role==='teacher'){
+        db.prepare(`
+          INSERT INTO teachers(user_id,subject,designation)
+          VALUES(?,?,?)
+        `).run(
+          u.lastInsertRowid,
+          clean(r.subject),
+          clean(r.designation)
+        );
+      }
+
+      if(r.role==='parent'){
+        db.prepare(
+          'INSERT INTO parents(user_id) VALUES(?)'
+        ).run(u.lastInsertRowid);
+      }
+
+      return u.lastInsertRowid;
+    });
+
+    const id=tx();
+
+    audit(
+      req.user.id,
+      'CREATE_USER',
+      `${r.role}:${username}`
+    );
+
+    res.json({id});
+  }catch(e){
+    res.status(400).json({error:e.message});
+  }
 });
+
 app.patch('/api/users/:id/status',requireAuth,requireRole('admin'),(req,res)=>{const active=bool(req.body.active)?1:0; const targetId=Number(req.params.id); const target=db.prepare('SELECT id,is_main_admin FROM users WHERE id=?').get(targetId); if(!target)return res.status(404).json({error:'User not found'}); if(target.is_main_admin && targetId!==req.user.id)return res.status(403).json({error:'Main Admin is protected'}); if(Number(req.params.id)===req.user.id && !active)return res.status(400).json({error:'You cannot deactivate yourself'}); db.prepare('UPDATE users SET active=?,updated_at=? WHERE id=?').run(active,now(),req.params.id); audit(req.user.id,'UPDATE_USER_STATUS',`${req.params.id}:${active}`); res.json({ok:true});});
 app.patch('/api/users/:id/password',requireAuth,requireRole('admin'),(req,res)=>{
 const p=String(req.body.password||'');
@@ -365,9 +645,102 @@ app.get('/api/students',requireAuth,(req,res)=>{
   res.json(rows);
 });
 app.post('/api/students',requireAuth,requireRole('admin'),(req,res)=>{
-  const r=req.body, name=clean(r.name), email=clean(r.email).toLowerCase(), password=String(r.password||'');
-  if(!name||!validEmail(email)||password.length<8||!r.student_id||!r.class_id)return res.status(400).json({error:'Name, email, 8+ character password, Student ID and Class are required'});
-  try{const tx=db.transaction(()=>{const u=db.prepare('INSERT INTO users(name,email,password_hash,role,phone) VALUES(?,?,?,?,?)').run(name,email,hashPassword(password),'student',clean(r.phone));const s=db.prepare('INSERT INTO students(user_id,class_id,section_id,roll,student_id,guardian_phone) VALUES(?,?,?,?,?,?)').run(u.lastInsertRowid,Number(r.class_id),r.section_id?Number(r.section_id):null,clean(r.roll),clean(r.student_id),clean(r.guardian_phone));const total=Math.max(0,Number(r.total_fee)||0);db.prepare('INSERT INTO fees(student_id,total_fee,due) VALUES(?,?,?)').run(s.lastInsertRowid,total,total);return s.lastInsertRowid;});const id=tx();audit(req.user.id,'CREATE_STUDENT',clean(r.student_id));res.json({id});}catch(e){res.status(400).json({error:e.message});}
+  const r=req.body;
+
+  const name=clean(r.name);
+  const email=clean(r.email).toLowerCase();
+  const username=clean(r.username||r.student_id).toLowerCase();
+  const password=String(r.password||'');
+
+  if(
+    !name ||
+    !validEmail(email) ||
+    !username ||
+    !/^[a-z0-9._-]{3,30}$/.test(username) ||
+    password.length<8 ||
+    !r.student_id ||
+    !r.class_id
+  ){
+    return res.status(400).json({
+      error:'Name, username, email, 8+ character password, Student ID and Class are required'
+    });
+  }
+
+  try{
+    const tx=db.transaction(()=>{
+      const u=db.prepare(`
+        INSERT INTO users
+        (name,username,email,password_hash,role,phone)
+        VALUES(?,?,?,?,?,?)
+      `).run(
+        name,
+        username,
+        email,
+        hashPassword(password),
+        'student',
+        clean(r.phone)
+      );
+
+      const st=db.prepare(`
+        INSERT INTO students
+        (user_id,class_id,section_id,roll,student_id,guardian_phone)
+        VALUES(?,?,?,?,?,?)
+      `).run(
+        u.lastInsertRowid,
+        Number(r.class_id),
+        r.section_id?Number(r.section_id):null,
+        clean(r.roll),
+        clean(r.student_id),
+        clean(r.guardian_phone)
+      );
+
+      const total=Math.max(
+        0,
+        Number(r.total_fee)||0
+      );
+
+      db.prepare(`
+        INSERT INTO fees
+        (student_id,total_fee,due,monthly_fee)
+        VALUES(?,?,?,?)
+      `).run(
+        st.lastInsertRowid,
+        total,
+        total,
+        total
+      );
+
+      if(total>0){
+        db.prepare(`
+          INSERT OR REPLACE INTO fee_cycles
+          (student_id,month_key,amount,paid_amount,status)
+          VALUES(?,?,?,?, 'DUE')
+        `).run(
+          st.lastInsertRowid,
+          currentMonthKey(),
+          total,
+          0
+        );
+      }
+
+      return st.lastInsertRowid;
+    });
+
+    const id=tx();
+
+    syncLegacyDue(id);
+    ensureUpcomingCycle(id);
+
+    audit(
+      req.user.id,
+      'CREATE_STUDENT',
+      clean(r.student_id)
+    );
+
+    res.json({id});
+  }catch(e){
+    res.status(400).json({error:e.message});
+  }
 });
 app.patch('/api/students/:id',requireAuth,requireRole('admin'),(req,res)=>{db.prepare(`UPDATE students SET class_id=?,section_id=?,roll=?,guardian_phone=? WHERE id=?`).run(req.body.class_id?Number(req.body.class_id):null,req.body.section_id?Number(req.body.section_id):null,clean(req.body.roll),clean(req.body.guardian_phone),req.params.id);res.json({ok:true});});
 app.post('/api/parent-links',requireAuth,requireRole('admin'),(req,res)=>{try{const parent=db.prepare('SELECT id FROM parents WHERE user_id=?').get(req.body.parent_user_id);if(!parent)return res.status(400).json({error:'Parent profile not found'});db.prepare('INSERT OR IGNORE INTO parent_students(parent_id,student_id) VALUES(?,?)').run(parent.id,Number(req.body.student_id));res.json({ok:true});}catch(e){res.status(400).json({error:e.message});}});
@@ -399,18 +772,502 @@ app.post('/api/results/:id/card',requireAuth,requireRole('admin','teacher'),(req
 });
 app.get('/api/results/:id/card',requireAuth,(req,res)=>{const r=db.prepare('SELECT * FROM results WHERE id=?').get(req.params.id);if(!r||!r.card_blob)return res.status(404).end();if(req.user.role==='student'&&r.student_id!==studentsForUser(req.user)[0]?.id)return res.status(403).end();if(req.user.role==='parent'&&!studentsForUser(req.user).some(s=>s.id===r.student_id))return res.status(403).end();res.setHeader('Content-Type',r.card_mime||'image/jpeg');res.setHeader('Cache-Control','private, no-store');res.end(r.card_blob);});
 
-app.get('/api/fees',requireAuth,(req,res)=>{let rows=db.prepare(`SELECT f.*,s.student_id sid,u.name student_name,c.class_no,sec.name section_name FROM fees f JOIN students s ON s.id=f.student_id JOIN users u ON u.id=s.user_id LEFT JOIN classes c ON c.id=s.class_id LEFT JOIN sections sec ON sec.id=s.section_id ORDER BY u.name`).all();if(req.user.role==='student'||req.user.role==='parent'){const ids=new Set(studentsForUser(req.user).map(s=>s.id));rows=rows.filter(r=>ids.has(r.student_id));}res.json(rows);});
-app.patch('/api/fees/:studentId',requireAuth,requireRole('admin'),(req,res)=>{const sid=Number(req.params.studentId), total=Math.max(0,Number(req.body.total_fee)||0), add=Math.max(0,Number(req.body.additional_charge)||0), adjustment=Number(req.body.adjustment)||0, current=db.prepare('SELECT due FROM fees WHERE student_id=?').get(sid);const nextDue=Math.max(0,(current?.due||0)+add+adjustment);const t=now();if(current)db.prepare('UPDATE fees SET total_fee=?,additional_charge=?,due=?,adjustment=?,adjustment_reason=?,updated_at=? WHERE student_id=?').run(total,add,nextDue,adjustment,clean(req.body.adjustment_reason),t,sid);else db.prepare('INSERT INTO fees(student_id,total_fee,additional_charge,due,adjustment,adjustment_reason,updated_at) VALUES(?,?,?,?,?,?,?)').run(sid,total,add,nextDue,adjustment,clean(req.body.adjustment_reason),t);audit(req.user.id,'UPDATE_FEE',`${sid}:${nextDue}`);res.json({ok:true,due:nextDue});});
+app.get('/api/fees',requireAuth,(req,res)=>{
+  advanceFeeStatuses();
 
-app.get('/api/payments',requireAuth,(req,res)=>{let rows=db.prepare(`SELECT p.*,s.student_id sid,u.name student_name,u.phone student_phone FROM payments p JOIN students s ON s.id=p.student_id JOIN users u ON u.id=s.user_id ORDER BY p.id DESC`).all();if(req.user.role==='student'||req.user.role==='parent'){const ids=new Set(studentsForUser(req.user).map(s=>s.id));rows=rows.filter(r=>ids.has(r.student_id));}res.json(rows);});
-app.post('/api/payments',requireAuth,requireRole('student','parent'),(req,res)=>{
-  const sid=Number(req.body.student_id), allowed=studentsForUser(req.user).some(s=>s.id===sid); if(!allowed)return res.status(403).json({error:'You cannot pay for this student'}); const amount=Number(req.body.amount)||0; if(amount<=0)return res.status(400).json({error:'Enter a valid amount'});
-  try{const x=db.prepare('INSERT INTO payments(student_id,method,transaction_id,amount,payer_phone) VALUES(?,?,?,?,?)').run(sid,req.body.method,clean(req.body.transaction_id),amount,clean(req.body.payer_phone));const admins=db.prepare("SELECT id FROM users WHERE role='admin' AND active=1").all();for(const a of admins)notifyUser(a.id,'New payment request',`Payment request #${x.lastInsertRowid} is waiting for verification.`,'payment');res.json({id:x.lastInsertRowid,status:'PENDING'});}catch(e){res.status(400).json({error:e.message});}
+  let rows=db.prepare(`
+    SELECT
+      f.*,
+      s.student_id sid,
+      u.name student_name,
+      c.class_no,
+      sec.name section_name
+    FROM fees f
+    JOIN students s ON s.id=f.student_id
+    JOIN users u ON u.id=s.user_id
+    LEFT JOIN classes c ON c.id=s.class_id
+    LEFT JOIN sections sec ON sec.id=s.section_id
+    ORDER BY u.name
+  `).all();
+
+  if(req.user.role==='student'||req.user.role==='parent'){
+    const ids=new Set(
+      studentsForUser(req.user).map(s=>s.id)
+    );
+
+    rows=rows.filter(r=>ids.has(r.student_id));
+  }
+
+  for(const r of rows){
+    ensureUpcomingCycle(r.student_id);
+    syncLegacyDue(r.student_id);
+  }
+
+  const cycles=db.prepare(`
+    SELECT *
+    FROM fee_cycles
+    ORDER BY month_key DESC,id DESC
+  `).all();
+
+  res.json(
+    rows.map(r=>({
+      ...r,
+      monthly_cycles:cycles.filter(
+        c=>c.student_id===r.student_id
+      ),
+      monthly_due:cycles
+        .filter(
+          c=>c.student_id===r.student_id &&
+             c.status==='DUE'
+        )
+        .reduce(
+          (a,c)=>a+Math.max(
+            0,
+            c.amount-c.paid_amount
+          ),
+          0
+        )
+    }))
+  );
 });
-app.patch('/api/payments/:id',requireAuth,requireRole('admin'),(req,res)=>{
-  const p=db.prepare('SELECT * FROM payments WHERE id=?').get(req.params.id);if(!p)return res.status(404).json({error:'Payment not found'});if(p.status!=='PENDING')return res.status(400).json({error:'This payment is already processed'});
-  if(req.body.status==='REJECTED'){db.prepare("UPDATE payments SET status='REJECTED',reject_reason=? WHERE id=?").run(clean(req.body.reason)||'Not approved',p.id);notifyUser(db.prepare('SELECT user_id FROM students WHERE id=?').get(p.student_id).user_id,'Payment rejected',clean(req.body.reason)||'Payment request was rejected.','payment');audit(req.user.id,'REJECT_PAYMENT',String(p.id));return res.json({ok:true});}
-  const tx=db.transaction(()=>{const fee=db.prepare('SELECT * FROM fees WHERE student_id=?').get(p.student_id);const due=Math.max(0,(fee?.due||0)-p.amount);const receipt=`SCA-${new Date().getFullYear()}-${String(p.id).padStart(6,'0')}`;db.prepare("UPDATE payments SET status='APPROVED',approved_at=?,receipt_no=? WHERE id=?").run(now(),receipt,p.id);if(fee)db.prepare('UPDATE fees SET due=?,updated_at=? WHERE student_id=?').run(due,now(),p.student_id);return {due,receipt};});const out=tx();const stu=db.prepare('SELECT user_id FROM students WHERE id=?').get(p.student_id);notifyUser(stu.user_id,'Payment approved',`Your payment was approved. Receipt: ${out.receipt}`,'payment');audit(req.user.id,'APPROVE_PAYMENT',`${p.id}:${out.receipt}`);res.json({ok:true,...out});
+
+app.post('/api/fees/monthly',requireAuth,requireRole('admin'),
+(req,res)=>{
+  const studentId=Number(req.body.student_id);
+  const monthKey=clean(req.body.month_key);
+  const amount=Math.max(
+    0,
+    Number(req.body.amount)||0
+  );
+  const status=monthKey>currentMonthKey()?'UPCOMING':'DUE';
+
+  if(
+    !studentId ||
+    !/^[0-9]{4}-(0[1-9]|1[0-2])$/.test(monthKey) ||
+    amount<=0
+  ){
+    return res.status(400).json({
+      error:'Student, valid month and amount are required'
+    });
+  }
+
+  try{
+    const student=db.prepare(
+      'SELECT id FROM students WHERE id=?'
+    ).get(studentId);
+
+    if(!student){
+      return res.status(404).json({
+        error:'Student not found'
+      });
+    }
+
+    const tx=db.transaction(()=>{
+      db.prepare(`
+        INSERT INTO fee_cycles
+        (student_id,month_key,amount,paid_amount,status)
+        VALUES(?,?,?,0,?)
+        ON CONFLICT(student_id,month_key)
+        DO UPDATE SET
+          amount=excluded.amount,
+          status=CASE
+            WHEN fee_cycles.paid_amount>=excluded.amount
+            THEN 'PAID'
+            ELSE 'DUE'
+          END,
+          updated_at=?
+      `).run(
+        studentId,
+        monthKey,
+        amount,
+        status,
+        now()
+      );
+
+      db.prepare(`
+        UPDATE fees
+        SET monthly_fee=?,updated_at=?
+        WHERE student_id=?
+      `).run(
+        amount,
+        now(),
+        studentId
+      );
+
+      ensureUpcomingCycle(studentId);
+      syncLegacyDue(studentId);
+    });
+
+    tx();
+
+    audit(
+      req.user.id,
+      'ADD_MONTHLY_DUE',
+      `${studentId}:${monthKey}:${amount}`
+    );
+
+    res.json({ok:true});
+  }catch(e){
+    res.status(400).json({error:e.message});
+  }
+});
+
+app.patch('/api/fees/:studentId',requireAuth,requireRole('admin'),
+(req,res)=>{
+  const sid=Number(req.params.studentId);
+  const total=Math.max(
+    0,
+    Number(req.body.total_fee)||0
+  );
+  const add=Math.max(
+    0,
+    Number(req.body.additional_charge)||0
+  );
+  const adjustment=Number(req.body.adjustment)||0;
+
+  const current=db.prepare(
+    'SELECT due FROM fees WHERE student_id=?'
+  ).get(sid);
+
+  const nextDue=Math.max(
+    0,
+    (current?.due||0)+add+adjustment
+  );
+
+  const t=now();
+
+  if(current){
+    db.prepare(`
+      UPDATE fees
+      SET
+        total_fee=?,
+        additional_charge=?,
+        due=?,
+        adjustment=?,
+        adjustment_reason=?,
+        updated_at=?
+      WHERE student_id=?
+    `).run(
+      total,
+      add,
+      nextDue,
+      adjustment,
+      clean(req.body.adjustment_reason),
+      t,
+      sid
+    );
+  }else{
+    db.prepare(`
+      INSERT INTO fees
+      (student_id,total_fee,additional_charge,due,adjustment,adjustment_reason,updated_at)
+      VALUES(?,?,?,?,?,?,?)
+    `).run(
+      sid,
+      total,
+      add,
+      nextDue,
+      adjustment,
+      clean(req.body.adjustment_reason),
+      t
+    );
+  }
+
+  audit(
+    req.user.id,
+    'UPDATE_FEE_LEGACY',
+    `${sid}:${nextDue}`
+  );
+
+  res.json({
+    ok:true,
+    due:nextDue
+  });
+});
+
+app.get('/api/payments',requireAuth,(req,res)=>{
+  let rows=db.prepare(`
+    SELECT
+      p.*,
+      s.student_id sid,
+      u.name student_name,
+      u.phone student_phone
+    FROM payments p
+    JOIN students s ON s.id=p.student_id
+    JOIN users u ON u.id=s.user_id
+    ORDER BY p.id DESC
+  `).all();
+
+  if(req.user.role==='student'||req.user.role==='parent'){
+    const ids=new Set(
+      studentsForUser(req.user).map(s=>s.id)
+    );
+
+    rows=rows.filter(
+      r=>ids.has(r.student_id)
+    );
+  }
+
+  res.json(rows);
+});
+
+app.post('/api/payments',requireAuth,
+requireRole('student','parent'),
+(req,res)=>{
+  const sid=Number(req.body.student_id);
+
+  const allowed=studentsForUser(req.user)
+    .some(s=>s.id===sid);
+
+  if(!allowed){
+    return res.status(403).json({
+      error:'You cannot pay for this student'
+    });
+  }
+
+  const amount=Number(req.body.amount)||0;
+
+  if(amount<=0){
+    return res.status(400).json({
+      error:'Enter a valid amount'
+    });
+  }
+
+  const cycle=db.prepare(`
+    SELECT *
+    FROM fee_cycles
+    WHERE student_id=? AND status='DUE'
+      AND amount>paid_amount
+    ORDER BY month_key ASC,id ASC
+    LIMIT 1
+  `).get(sid);
+
+  if(cycle){
+    const remaining=Math.max(
+      0,
+      cycle.amount-cycle.paid_amount
+    );
+
+    if(amount>remaining){
+      return res.status(400).json({
+        error:'Amount cannot exceed the selected month due'
+      });
+    }
+  }
+
+  try{
+    const feeMonth=cycle?.month_key||'';
+
+    const x=db.prepare(`
+      INSERT INTO payments
+      (student_id,method,transaction_id,amount,payer_phone,fee_month)
+      VALUES(?,?,?,?,?,?)
+    `).run(
+      sid,
+      req.body.method,
+      clean(req.body.transaction_id),
+      amount,
+      clean(req.body.payer_phone),
+      feeMonth
+    );
+
+    const admins=db.prepare(
+      "SELECT id FROM users WHERE role='admin' AND active=1"
+    ).all();
+
+    for(const a of admins){
+      notifyUser(
+        a.id,
+        'New payment request',
+        `Payment request #${x.lastInsertRowid} is waiting for verification.`,
+        'payment'
+      );
+    }
+
+    res.json({
+      id:x.lastInsertRowid,
+      status:'PENDING'
+    });
+  }catch(e){
+    res.status(400).json({
+      error:e.message
+    });
+  }
+});
+
+app.patch('/api/payments/:id',
+requireAuth,
+requireRole('admin'),
+(req,res)=>{
+  const p=db.prepare(
+    'SELECT * FROM payments WHERE id=?'
+  ).get(req.params.id);
+
+  if(!p){
+    return res.status(404).json({
+      error:'Payment not found'
+    });
+  }
+
+  if(p.status!=='PENDING'){
+    return res.status(400).json({
+      error:'This payment is already processed'
+    });
+  }
+
+  if(req.body.status==='REJECTED'){
+    db.prepare(`
+      UPDATE payments
+      SET status='REJECTED',reject_reason=?
+      WHERE id=?
+    `).run(
+      clean(req.body.reason)||'Not approved',
+      p.id
+    );
+
+    const stu=db.prepare(
+      'SELECT user_id FROM students WHERE id=?'
+    ).get(p.student_id);
+
+    if(stu){
+      notifyUser(
+        stu.user_id,
+        'Payment rejected',
+        clean(req.body.reason)||'Payment request was rejected.',
+        'payment'
+      );
+    }
+
+    audit(
+      req.user.id,
+      'REJECT_PAYMENT',
+      String(p.id)
+    );
+
+    return res.json({ok:true});
+  }
+
+  const tx=db.transaction(()=>{
+    let dueAfter=0;
+
+    const receipt=
+      `SCA-${new Date().getFullYear()}-${String(p.id).padStart(6,'0')}`;
+
+    if(p.fee_month){
+      const c=db.prepare(`
+        SELECT *
+        FROM fee_cycles
+        WHERE student_id=? AND month_key=?
+      `).get(
+        p.student_id,
+        p.fee_month
+      );
+
+      if(!c){
+        return {
+          error:'Fee month no longer exists'
+        };
+      }
+
+      const paid=Math.min(
+        c.amount,
+        c.paid_amount+p.amount
+      );
+
+      const status=
+        paid>=c.amount
+        ? 'PAID'
+        : 'DUE';
+
+      db.prepare(`
+        UPDATE fee_cycles
+        SET
+          paid_amount=?,
+          status=?,
+          updated_at=?
+        WHERE id=?
+      `).run(
+        paid,
+        status,
+        now(),
+        c.id
+      );
+
+      dueAfter=syncLegacyDue(
+        p.student_id
+      );
+    }else{
+      const fee=db.prepare(
+        'SELECT * FROM fees WHERE student_id=?'
+      ).get(p.student_id);
+
+      dueAfter=Math.max(
+        0,
+        (fee?.due||0)-p.amount
+      );
+
+      if(fee){
+        db.prepare(`
+          UPDATE fees
+          SET due=?,updated_at=?
+          WHERE student_id=?
+        `).run(
+          dueAfter,
+          now(),
+          p.student_id
+        );
+      }
+    }
+
+    db.prepare(`
+      UPDATE payments
+      SET
+        status='APPROVED',
+        approved_at=?,
+        receipt_no=?
+      WHERE id=?
+    `).run(
+      now(),
+      receipt,
+      p.id
+    );
+
+    return {
+      due:dueAfter,
+      receipt
+    };
+  });
+
+  const out=tx();
+
+  if(out.error){
+    return res.status(400).json({
+      error:out.error
+    });
+  }
+
+  const stu=db.prepare(
+    'SELECT user_id FROM students WHERE id=?'
+  ).get(p.student_id);
+
+  if(stu){
+    notifyUser(
+      stu.user_id,
+      'Payment approved',
+      `Your payment was approved. Receipt: ${out.receipt}`,
+      'payment'
+    );
+  }
+
+  audit(
+    req.user.id,
+    'APPROVE_PAYMENT',
+    `${p.id}:${out.receipt}`
+  );
+
+  res.json({
+    ok:true,
+    ...out
+  });
 });
 
 app.get('/api/routines',requireAuth,(req,res)=>{let rows=db.prepare(`SELECT r.*,c.class_no,sec.name section_name FROM routines r LEFT JOIN classes c ON c.id=r.class_id LEFT JOIN sections sec ON sec.id=r.section_id WHERE r.published=1 ORDER BY r.type,r.id DESC`).all();if(req.user.role==='student'||req.user.role==='parent'){const ss=studentsForUser(req.user);const pairs=new Set(ss.map(s=>`${s.class_id}:${s.section_id||0}`));rows=rows.filter(r=>!r.class_id||ss.some(s=>s.class_id===r.class_id && (!r.section_id||r.section_id===s.section_id)));}res.json(rows);});
