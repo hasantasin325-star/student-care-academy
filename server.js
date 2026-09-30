@@ -2,6 +2,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 
@@ -19,6 +20,56 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '8mb' }));
 app.use(express.urlencoded({ extended: true, limit: '8mb' }));
 app.use(express.static(PUBLIC));
+// NEON_SYNC_HOOK_START
+let neonSyncTimer = null;
+let neonSyncChild = null;
+
+function runNeonSync() {
+  if (!process.env.DATABASE_URL || neonSyncChild) return;
+
+  neonSyncChild = spawn(
+    process.execPath,
+    [path.join(ROOT, 'neon-sync.js'), 'sync', DB_FILE],
+    { stdio: 'inherit', env: process.env }
+  );
+
+  neonSyncChild.on('close', () => {
+    neonSyncChild = null;
+  });
+
+  neonSyncChild.on('error', () => {
+    neonSyncChild = null;
+  });
+}
+
+function scheduleNeonSync(delay = 10000) {
+  if (!process.env.DATABASE_URL) return;
+
+  if (neonSyncTimer) {
+    clearTimeout(neonSyncTimer);
+  }
+
+  neonSyncTimer = setTimeout(() => {
+    neonSyncTimer = null;
+    runNeonSync();
+  }, delay);
+}
+
+app.use((req, res, next) => {
+  if (
+    req.path.startsWith('/api/') &&
+    ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)
+  ) {
+    res.on('finish', () => {
+      if (res.statusCode < 500) {
+        scheduleNeonSync(10000);
+      }
+    });
+  }
+
+  next();
+});
+// NEON_SYNC_HOOK_END
 
 const db = new Database(DB_FILE);
 db.pragma('journal_mode = WAL');
@@ -1315,4 +1366,52 @@ app.get('/api/audit-logs',requireAuth,requireRole('admin'),(req,res)=>res.json(d
 
 app.get(/.*/,(req,res)=>res.sendFile(path.join(PUBLIC,'index.html')));
 
+
+// NEON_SYNC_SHUTDOWN_START
+let shuttingDown = false;
+
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  if (neonSyncTimer) {
+    clearTimeout(neonSyncTimer);
+    neonSyncTimer = null;
+  }
+
+  if (!process.env.DATABASE_URL) {
+    try { db.close(); } catch (e) {}
+    process.exit(0);
+    return;
+  }
+
+  let finished = false;
+
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+
+    try { db.close(); } catch (e) {}
+    process.exit(0);
+  };
+
+  const child = spawn(
+    process.execPath,
+    [path.join(ROOT, 'neon-sync.js'), 'sync', DB_FILE],
+    { stdio: 'inherit', env: process.env }
+  );
+
+  child.on('close', finish);
+  child.on('error', finish);
+
+  setTimeout(finish, 12000);
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+if (process.env.DATABASE_URL) {
+  setTimeout(() => scheduleNeonSync(1000), 5000);
+}
+// NEON_SYNC_SHUTDOWN_END
 app.listen(PORT,()=>console.log(`Student Care Academy running at http://localhost:${PORT}`));
