@@ -218,6 +218,14 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 `);
 
+try {
+  db.exec("ALTER TABLE users ADD COLUMN is_main_admin INTEGER NOT NULL DEFAULT 0");
+} catch (e) {}
+
+if (!db.prepare("SELECT 1 FROM users WHERE role='admin' AND is_main_admin=1 LIMIT 1").get()) {
+  const firstAdmin = db.prepare("SELECT id FROM users WHERE role='admin' ORDER BY id ASC LIMIT 1").get();
+  if (firstAdmin) db.prepare("UPDATE users SET is_main_admin=1 WHERE id=?").run(firstAdmin.id);
+}
 for (let i = 1; i <= 12; i++) {
   db.prepare('INSERT OR IGNORE INTO classes(class_no,name) VALUES(?,?)').run(i, `Class ${i}`);
 }
@@ -226,7 +234,7 @@ const now = () => new Date().toISOString();
 const clean = v => (v == null ? '' : String(v).trim());
 const bool = v => !!(v === true || v === 1 || v === '1' || v === 'true');
 const audit = (userId, action, details='') => db.prepare('INSERT INTO audit_logs(user_id,action,details) VALUES(?,?,?)').run(userId || null, action, details);
-const userView = u => u ? ({ id:u.id, name:u.name, email:u.email, phone:u.phone || '', role:u.role, active:!!u.active }) : null;
+const userView = u => u ? ({ id:u.id, name:u.name, email:u.email, phone:u.phone || '', role:u.role, active:!!u.active, is_main_admin:!!u.is_main_admin }) : null;
 
 function hashPassword(password) {
   return bcrypt.hashSync(password, 12);
@@ -293,7 +301,7 @@ app.post('/api/setup/admin',(req,res)=>{
   if (db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()) return res.status(400).json({error:'Admin setup is already completed'});
   const name=clean(req.body.name), email=clean(req.body.email).toLowerCase(), password=String(req.body.password||''), confirm=String(req.body.confirm||'');
   if (!name || !validEmail(email) || password.length<8 || password!==confirm) return res.status(400).json({error:'Enter a valid name, email and matching password (minimum 8 characters).'});
-  const info=db.prepare("INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,'admin')").run(name,email,hashPassword(password));
+  const info=db.prepare("INSERT INTO users(name,email,password_hash,role,is_main_admin) VALUES(?,?,?,'admin',1)").run(name,email,hashPassword(password));
   audit(info.lastInsertRowid,'INITIAL_ADMIN_SETUP',email); res.json({ok:true});
 });
 
@@ -317,7 +325,7 @@ app.get('/api/dashboard',requireAuth,(req,res)=>{
   res.json({role:req.user.role,students:get('SELECT COUNT(*) c FROM students'),teachers:get('SELECT COUNT(*) c FROM teachers'),parents:get('SELECT COUNT(*) c FROM parents'),pendingPayments:get("SELECT COUNT(*) c FROM payments WHERE status='PENDING'"),due:db.prepare('SELECT COALESCE(SUM(due),0) due FROM fees').get().due,unread:db.prepare('SELECT COUNT(*) c FROM notifications WHERE user_id=? AND read=0').get(req.user.id).c});
 });
 
-app.get('/api/users',requireAuth,requireRole('admin'),(req,res)=>res.json(db.prepare('SELECT id,name,email,phone,role,active,created_at FROM users ORDER BY id DESC').all()));
+app.get('/api/users',requireAuth,requireRole('admin'),(req,res)=>res.json(db.prepare('SELECT id,name,email,phone,role,active,is_main_admin,created_at FROM users ORDER BY id DESC').all()));
 app.post('/api/users',requireAuth,requireRole('admin'),(req,res)=>{
   const r=req.body, name=clean(r.name), email=clean(r.email).toLowerCase(), password=String(r.password||'');
   if(!name||!validEmail(email)||password.length<8||!['admin','teacher','student','parent'].includes(r.role))return res.status(400).json({error:'Valid name, email, role and 8+ character password are required'});
@@ -328,8 +336,18 @@ app.post('/api/users',requireAuth,requireRole('admin'),(req,res)=>{
       return u.lastInsertRowid;}); const id=tx(); audit(req.user.id,'CREATE_USER',`${r.role}:${email}`); res.json({id});
   }catch(e){res.status(400).json({error:e.message});}
 });
-app.patch('/api/users/:id/status',requireAuth,requireRole('admin'),(req,res)=>{const active=bool(req.body.active)?1:0; if(Number(req.params.id)===req.user.id && !active)return res.status(400).json({error:'You cannot deactivate yourself'}); db.prepare('UPDATE users SET active=?,updated_at=? WHERE id=?').run(active,now(),req.params.id); audit(req.user.id,'UPDATE_USER_STATUS',`${req.params.id}:${active}`); res.json({ok:true});});
-app.patch('/api/users/:id/password',requireAuth,requireRole('admin'),(req,res)=>{const p=String(req.body.password||'');if(p.length<8)return res.status(400).json({error:'Password must be at least 8 characters'});db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(hashPassword(p),now(),req.params.id);audit(req.user.id,'RESET_USER_PASSWORD',String(req.params.id));res.json({ok:true});});
+app.patch('/api/users/:id/status',requireAuth,requireRole('admin'),(req,res)=>{const active=bool(req.body.active)?1:0; const targetId=Number(req.params.id); const target=db.prepare('SELECT id,is_main_admin FROM users WHERE id=?').get(targetId); if(!target)return res.status(404).json({error:'User not found'}); if(target.is_main_admin && targetId!==req.user.id)return res.status(403).json({error:'Main Admin is protected'}); if(Number(req.params.id)===req.user.id && !active)return res.status(400).json({error:'You cannot deactivate yourself'}); db.prepare('UPDATE users SET active=?,updated_at=? WHERE id=?').run(active,now(),req.params.id); audit(req.user.id,'UPDATE_USER_STATUS',`${req.params.id}:${active}`); res.json({ok:true});});
+app.patch('/api/users/:id/password',requireAuth,requireRole('admin'),(req,res)=>{
+const p=String(req.body.password||'');
+const targetId=Number(req.params.id);
+const target=db.prepare('SELECT id,is_main_admin FROM users WHERE id=?').get(targetId);
+if(!target)return res.status(404).json({error:'User not found'});
+if(target.is_main_admin && targetId!==req.user.id)return res.status(403).json({error:'Main Admin is protected'});
+if(p.length<8)return res.status(400).json({error:'Password must be at least 8 characters'});
+db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(hashPassword(p),now(),targetId);
+audit(req.user.id,'RESET_USER_PASSWORD',String(targetId));
+res.json({ok:true});
+});
 
 app.get('/api/classes',requireAuth,(req,res)=>res.json(db.prepare(`SELECT c.*, COALESCE((SELECT json_group_array(json_object('id',s.id,'name',s.name,'active',s.active)) FROM sections s WHERE s.class_id=c.id),'[]') sections_json FROM classes c ORDER BY c.class_no`).all().map(c=>({...c,sections:JSON.parse(c.sections_json)}))));
 app.patch('/api/classes/:id',requireAuth,requireRole('admin'),(req,res)=>{db.prepare('UPDATE classes SET name=?,active=? WHERE id=?').run(clean(req.body.name)||`Class ${req.body.class_no}`,bool(req.body.active)?1:0,req.params.id);audit(req.user.id,'UPDATE_CLASS',String(req.params.id));res.json({ok:true});});
