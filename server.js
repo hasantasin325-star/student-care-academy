@@ -88,6 +88,21 @@ app.use((req, res, next) => {
 // NEON_SYNC_HOOK_END
 
 const db = new Database(DB_FILE);
+/* PAYMENT_SETTINGS_TABLE_START */
+db.exec(`
+CREATE TABLE IF NOT EXISTS payment_settings (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  bkash_number TEXT NOT NULL DEFAULT '01760222201',
+  nagad_number TEXT NOT NULL DEFAULT '01760222201',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT OR IGNORE INTO payment_settings
+(id,bkash_number,nagad_number)
+VALUES
+(1,'01760222201','01760222201');
+`);
+/* PAYMENT_SETTINGS_TABLE_END */
+
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
@@ -1098,6 +1113,49 @@ app.patch('/api/fees/:studentId',requireAuth,requireRole('admin'),
   });
 });
 
+/* PAYMENT_SETTINGS_API_START */
+app.get('/api/payment-settings',requireAuth,(req,res)=>{
+  const settings=db.prepare(`
+    SELECT bkash_number,nagad_number,updated_at
+    FROM payment_settings
+    WHERE id=1
+  `).get();
+
+  res.json(settings || {
+    bkash_number:'01760222201',
+    nagad_number:'01760222201'
+  });
+});
+
+app.patch('/api/payment-settings',requireAuth,requireRole('admin'),(req,res)=>{
+  const bkash=String(req.body.bkash_number||'').replace(/\D/g,'');
+  const nagad=String(req.body.nagad_number||'').replace(/\D/g,'');
+
+  if(!/^01\d{9}$/.test(bkash) || !/^01\d{9}$/.test(nagad)){
+    return res.status(400).json({
+      error:'Enter valid Bangladesh mobile numbers.'
+    });
+  }
+
+  db.prepare(`
+    UPDATE payment_settings
+    SET bkash_number=?,nagad_number=?,updated_at=?
+    WHERE id=1
+  `).run(bkash,nagad,now());
+
+  audit(
+    req.user.id,
+    'UPDATE_PAYMENT_SETTINGS',
+    `bKash:${bkash}|Nagad:${nagad}`
+  );
+
+  res.json({
+    ok:true,
+    bkash_number:bkash,
+    nagad_number:nagad
+  });
+});
+/* PAYMENT_SETTINGS_API_END */
 app.get('/api/payments',requireAuth,(req,res)=>{
   let rows=db.prepare(`
     SELECT
@@ -1476,5 +1534,6 @@ if (process.env.DATABASE_URL && db.prepare("SELECT 1 FROM users WHERE role='admi
 }
 // NEON_SYNC_SHUTDOWN_END
 app.listen(PORT,()=>console.log(`Student Care Academy running at http://localhost:${PORT}`));
+
 
 
