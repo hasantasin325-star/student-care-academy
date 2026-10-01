@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -718,12 +718,31 @@ app.post('/api/students',requireAuth,requireRole('admin'),(req,res)=>{
 
   const name=clean(r.name);
   const email=clean(r.email).toLowerCase();
-  const username=clean(r.username||r.student_id).toLowerCase();
+  const studentId=clean(r.student_id);
+  const requestedUsername=clean(r.username).toLowerCase();
   const password=String(r.password||'');
 
-  if(!username || !r.student_id || !r.class_id){
+  if(!studentId || !r.class_id){
     return res.status(400).json({
-      error:'Username, Student ID and Class are required'
+      error:'Student ID and Class are required'
+    });
+  }
+
+  // Username is optional. If not provided, create a safe unique username.
+  let username=requestedUsername;
+  if(!username){
+    const base='student-'+studentId.toLowerCase().replace(/[^a-z0-9._-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'');
+    username=base.length>=3 ? base.slice(0,30) : 'student-user';
+    let n=2;
+    while(db.prepare('SELECT 1 FROM users WHERE LOWER(username)=? LIMIT 1').get(username)){
+      const suffix='-'+n++;
+      username=(base.slice(0,30-suffix.length)+suffix).slice(0,30);
+    }
+  }
+
+  if(!/^[a-z0-9._-]{3,30}$/.test(username)){
+    return res.status(400).json({
+      error:'Username must be 3-30 characters using letters, numbers, dot, underscore or hyphen.'
     });
   }
 
@@ -790,7 +809,7 @@ app.post('/api/students',requireAuth,requireRole('admin'),(req,res)=>{
         Number(r.class_id),
         r.section_id?Number(r.section_id):null,
         clean(r.roll),
-        clean(r.student_id),
+        studentId,
         clean(r.guardian_phone)
       );
 
@@ -828,7 +847,7 @@ app.post('/api/students',requireAuth,requireRole('admin'),(req,res)=>{
     audit(
       req.user.id,
       'CREATE_STUDENT',
-      clean(r.student_id)
+      studentId
     );
 
     res.json({id});
@@ -1457,4 +1476,5 @@ if (process.env.DATABASE_URL && db.prepare("SELECT 1 FROM users WHERE role='admi
 }
 // NEON_SYNC_SHUTDOWN_END
 app.listen(PORT,()=>console.log(`Student Care Academy running at http://localhost:${PORT}`));
+
 
